@@ -1,0 +1,11 @@
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background-color: #0f1923;
+  color: #e2e8f0;
+  min-height: 100vh;
+}
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #0f1923; }
+::-webkit-scrollbar-thumb { background: #4a566e; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #7dd3fc; }

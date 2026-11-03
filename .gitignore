@@ -1,0 +1,23 @@
+node_modules/
+dist/
+# Machine-local Claude Code config: settings.json and the hooks reference
+# absolute paths under /Users/bennettschiff, so they are not portable. Matches
+# how mlb-research-dashboard ignores its .claude/. launch.json stays tracked (already is).
+.claude/
+!.claude/launch.json
+.DS_Store
+*.log
+.vercel
+
+# dotenv environment variable files
+.env
+.env.local
+.env*.local
+
+# Pay-once Odds API snapshots. The durable copy is Google Drive
+# (gdrive:wnba-research-dashboard-archive/historical-odds/) — NOT Supabase: the odds
+# table was created and dropped the same day, 2026-08-31. 40k rows cost 31 MB in
+# Postgres vs 0.29 MB gzipped, on a project already at 274 MB of a 500 MB
+# ceiling. See scripts/lib/odds-archive.mjs.
+scripts/odds_cache/
+scripts/out/

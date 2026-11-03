@@ -1,0 +1,22 @@
+{
+  "rewrites": [
+    { "source": "/espn-site/:path*", "destination": "https://site.api.espn.com/:path*" },
+    { "source": "/espn-core/:path*", "destination": "https://sports.core.api.espn.com/:path*" },
+    { "source": "/espn-web/:path*",  "destination": "https://site.web.api.espn.com/:path*" }
+  ],
+  "headers": [
+    {
+      "source": "/assets/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }
+      ]
+    },
+    {
+      "source": "/((?!assets/).*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" },
+        { "key": "Pragma", "value": "no-cache" }
+      ]
+    }
+  ]
+}

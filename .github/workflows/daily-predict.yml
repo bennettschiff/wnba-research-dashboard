@@ -1,0 +1,92 @@
+name: WNBA daily model predict + grade
+
+# Two passes daily (cron is UTC; ET shown is DST offset):
+#   - 07:37 UTC = 3:37 AM ET — early pass: prior night's box scores are posted
+#     (WNBA games end by ~11 PM ET), so yesterday grades in time for the
+#     pre-dawn lab chain (mlb-research-dashboard lab-analyst.yml at 08:15 UTC + local
+#     Claude analyst routine at ~4:50 AM ET). Added 2026-07-18.
+#   - 15:07 UTC = 11:07 AM ET — original pass, kept as grading backup and as
+#     the canonical pre-tip prediction run (still well before tip-off, so
+#     today's predictions are recorded pre-game / leakage-safe).
+#
+# Minutes are deliberately odd (:37, :07) rather than :00/:45. GitHub queues
+# scheduled runs and delays them under load, and load spikes hardest on the hour
+# and on common round minutes. This does not make delay impossible — on
+# 2026-07-21 the :45 pass landed 2h20m late — it just avoids the worst queues.
+# The real defenses against a late run are downstream and do not depend on the
+# clock: the promotion gate chains off this workflow's completion (see
+# promotion-gate.yml), and lab-analyst-wnba grades for itself with
+# `daily-predict.mjs --grade-only` rather than assuming this already ran.
+on:
+  # Production runs this on a cron schedule. The public copy is manual-only,
+  # so a fork without secrets never fires it.
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Predict a specific date (YYYYMMDD, blank = today ET)'
+        required: false
+        default: ''
+
+# A `permissions:` block REPLACES the default token scopes rather than adding to
+# them, so every scope this job needs must be listed. contents: read is what
+# actions/checkout uses to fetch this private repo; omitting it returns
+# "remote: Repository not found" — a 403 masked as a 404, which reads like an
+# infra blip. (mlb-research-dashboard lost a day of picks to exactly this.)
+permissions:
+  contents: read   # actions/checkout — load-bearing, see above
+  issues: write    # self-alert step below
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          check-latest: true   # runner cache lags security releases
+
+      - name: Predict today + grade past
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            ARGS="--date=${{ github.event.inputs.date }}"
+          fi
+          node scripts/daily-predict.mjs $ARGS
+
+      # ops-alert.yml's workflow_run listener is NOT reliable on this account.
+      # Measured 2026-07-29 over 30 days: only 9 of 85 watched completions were
+      # ever delivered (11%), and it reacted to 0 of 2 real failures — this repo
+      # has never had a single alert issue opened. mlb-research-dashboard hit the same
+      # blind spot on its heaviest workflow and fixed it exactly this way.
+      # Firing the issue directly from the job removes the webhook dependency.
+      # Same title ops-alert would use, so if its listener DOES fire, the two
+      # dedupe onto one issue instead of opening two. cancelled() is included
+      # because a timeout-minutes kill is not reported as 'failure'.
+      # Costs zero Actions minutes on success — the step is simply skipped.
+      - name: Self-alert on failure (ops-alert workflow_run delivery is unreliable)
+        if: failure() || cancelled()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="🚨 Scheduled workflow failing: WNBA daily model predict + grade"
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$TITLE\"" --json number,title \
+            --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+          BODY="[WNBA daily model predict + grade]($RUN_URL) failed at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+            echo "Commented on existing issue #$EXISTING"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
+              --body "$BODY
+
+          Close this issue once the workflow is green again. Repeat failures will be added as comments here instead of new issues."
+            echo "Opened new issue"
+          fi

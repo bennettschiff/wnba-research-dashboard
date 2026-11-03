@@ -1,0 +1,129 @@
+name: Ops alert (workflow failures)
+
+# Watches every scheduled workflow in THIS repo and opens (or comments on) a
+# GitHub issue when one fails, is cancelled, or times out — so a broken nightly
+# job cannot fail silently for days.
+#
+# Added 2026-07-21. Until then this repo had NO failure alerting: the MLB repo's
+# ops-alert only sees its own workflows (`workflow_run` is same-repo), so all
+# three WNBA workflows failed silently. That mattered more once the WNBA lab
+# moved here — the analyst and the promotion gate both run in this repo now.
+#
+# NOTE: new scheduled workflows must be added to the `workflows:` list below.
+#
+# Ported from mlb-research-dashboard/.github/workflows/ops-alert.yml. Keep the two in
+# sync when either gains a triage rule.
+on:
+  workflow_run:
+    workflows:
+      - "WNBA daily model predict + grade"
+      - "Nightly Supabase → Drive backup (WNBA)"
+      # Not scheduled, but watched for the same reason the MLB lab watches its
+      # CI: a red build on master is exactly the signal you must not have to go
+      # looking for.
+      - "CI"
+    types: [completed]
+
+permissions:
+  issues: write
+  actions: write   # needed for `gh run rerun` (auto-retry of transient infra failures)
+
+jobs:
+  alert:
+    # 'cancelled' covers timeout-minutes kills — a timeout does not report
+    # 'failure', which is how a backstop job once died silently for 3+ days in
+    # the MLB repo.
+    if: github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled' || github.event.workflow_run.conclusion == 'timed_out'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Ignore GitHub runner-starvation cancellations
+        id: triage
+        if: github.event.workflow_run.conclusion == 'cancelled'
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          # A 'cancelled' run means one of two very different things:
+          #   1. A step exceeded timeout-minutes and GitHub killed it  → REAL failure, alert.
+          #   2. GitHub never handed the job to a hosted runner        → infra noise, not ours.
+          # Only case 2 carries the "not acquired by Runner" annotation. If EVERY
+          # cancelled job in the run is annotated that way, suppress the false alert.
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | select(.conclusion=="cancelled") | .id')
+          if [ -z "$jobs" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          all_starved=1
+          for j in $jobs; do
+            msgs=$(gh api "repos/$GITHUB_REPOSITORY/check-runs/$j/annotations" \
+              --jq '.[].message' 2>/dev/null || echo "")
+            case "$msgs" in
+              *"not acquired by Runner"*) : ;;   # this job never got a runner
+              *) all_starved=0 ;;                # some other cancel reason → treat as real
+            esac
+          done
+          if [ "$all_starved" = 1 ]; then
+            echo "Runner-starvation cancellation — suppressing false alert."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Auto-retry transient infra failures
+        id: retry
+        # Transient GitHub-infra failures ("Service Unavailable" resolving action
+        # downloads, runner provisioning) die in "Set up job" BEFORE any of our steps
+        # run, so in-job retry wrappers can't help — only a job-level rerun recovers
+        # them. Guarded by run_attempt==1 so a genuinely-broken job can't loop. These
+        # workflows are idempotent (the gate recomputes rather than incrementing;
+        # grading only touches rows with graded_at IS NULL), so a redundant rerun is
+        # a no-op. If the rerun also fails it re-fires this workflow at
+        # run_attempt==2, where this step is skipped and it falls through to alert.
+        if: >
+          github.event.workflow_run.conclusion == 'failure' &&
+          github.event.workflow_run.run_attempt == 1 &&
+          steps.triage.outputs.skip != 'true'
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          INFRA='Service Unavailable|Failed to resolve action download info|not acquired by Runner|lost communication with the server|received the shutdown signal'
+          annos=""
+          for j in $(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs" \
+              --jq '.jobs[] | select(.conclusion=="failure") | .id'); do
+            annos+=$(gh api "repos/$GITHUB_REPOSITORY/check-runs/$j/annotations" \
+              --jq '.[].message' 2>/dev/null || true)
+            annos+=$'\n'
+          done
+          if echo "$annos" | grep -qE "$INFRA"; then
+            echo "Transient infra failure detected — rerunning failed jobs for run $RUN_ID."
+            gh run rerun "$RUN_ID" --failed
+            echo "retried=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No infra signature — leaving for immediate alert."
+            echo "retried=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or update failure issue
+        if: steps.triage.outputs.skip != 'true' && steps.retry.outputs.retried != 'true'
+        env:
+          WF_NAME: ${{ github.event.workflow_run.name }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_AT: ${{ github.event.workflow_run.run_started_at }}
+        run: |
+          TITLE="🚨 Scheduled workflow failing: $WF_NAME"
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$TITLE\"" --json number,title \
+            --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+          BODY="[$WF_NAME]($RUN_URL) failed at $RUN_AT."
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+            echo "Commented on existing issue #$EXISTING"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
+              --body "$BODY
+
+          Close this issue once the workflow is green again. Repeat failures will be added as comments here instead of new issues."
+            echo "Opened new issue"
+          fi

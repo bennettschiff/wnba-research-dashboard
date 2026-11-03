@@ -1,0 +1,7 @@
+{
+  "_comment": "Promoted pick gates, written by the promotion pipeline after a proposal out-earns the incumbent on a forward shadow slate. Public build: empty — production gates are private.",
+  "_schema": "{ globals: { sigma_max?, gp_min? }, markets: { <market>: { prob_min?, prob_max?, edge_min?, source, promoted, shadow_days, shadow_delta_units, retain_pct } } }",
+  "version": "public-1",
+  "globals": {},
+  "markets": {}
+}

@@ -1,0 +1,43 @@
+name: CI
+
+# The suite already runs nightly inside promotion-gate.yml, as the guard that
+# reverts a bad graduation. That is the wrong moment to learn a commit is broken:
+# it fires up to a day later, in a job whose failure reads as "the gate tripped"
+# rather than "the last push was wrong". scripts/lib/sb-fetch.guard.test.mjs in
+# particular has to fail on the commit that adds a bare Supabase fetch, or it is
+# just a nightly report of a mistake already merged.
+#
+# Mirrors the MLB and NFL labs' CI. Nothing here needs credentials — the unit
+# tests are pure, and the guard only reads files off disk.
+
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - '**/*.md'
+      - 'lab/**'
+      - 'docs/**'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'lab/**'
+      - 'docs/**'
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      # Pinned to 22 for the reason spelled out in promotion-gate.yml: a dev/CI
+      # version split is how the 2026-07-21 `node --test` glob failure got in.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          check-latest: true   # runner cache lags security releases
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
+      - run: npm run build

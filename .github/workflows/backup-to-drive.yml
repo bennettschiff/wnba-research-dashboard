@@ -1,0 +1,226 @@
+name: Nightly Supabase → Drive backup (WNBA)
+
+# 4:45 AM ET (08:45 UTC). Mirrors the MLB/NFL labs' backup; reuse the same
+# RCLONE_CONF secret (your Google account). Backups land in a separate
+# wnba-research-dashboard-backups folder so the projects never collide. WNBA shares the
+# MLB Supabase project, so only the wnba_* tables are dumped here (the MLB backup
+# already covers everything else).
+# TWO PASSES, BECAUSE A DROPPED RUN IS SILENT. 2026-08-19 has no backup folder
+# and nothing reported it: this workflow self-alerts on FAILURE, and a scheduled
+# run GitHub drops never starts, so it never fails.
+#
+# Chaining off another workflow does NOT fix that, and was considered and
+# rejected 2026-08-31. Every workflow_run chain in this repo is dead or dying —
+# promotion-gate.yml removed its chain off daily-predict on 2026-08-03 after an
+# audit found it had never once fired for a real scheduled upstream run, and
+# ops-alert's listener delivers 11% of watched completions. Adding one here would
+# re-add exactly the dead weight that was deliberately removed there.
+#
+# So: an independent second cron (a drop is per-run, not per-workflow, so a
+# different hour is a genuine retry), plus the gap check below that makes any
+# night that slips through both visible after the fact. Re-running is harmless —
+# the dump is idempotent and rclone copies into the same dated folder.
+on:
+  # Production runs this on a cron schedule. The public copy is manual-only,
+  # so a fork without secrets never fires it.
+  workflow_dispatch:
+    inputs:
+      tables:
+        description: 'Comma-separated table list (blank = all wnba_* tables)'
+        required: false
+        default: ''
+      prune:
+        description: 'Retention: "report" lists what would be removed (default), "apply" actually deletes'
+        required: false
+        default: 'report'
+
+# A `permissions:` block REPLACES the default token scopes rather than adding to
+# them, so every scope this job needs must be listed. contents: read is what
+# actions/checkout uses to fetch this private repo; omitting it returns
+# "remote: Repository not found" — a 403 masked as a 404, which reads like an
+# infra blip. (mlb-research-dashboard lost a day of picks to exactly this.)
+permissions:
+  contents: read   # actions/checkout — load-bearing, see above
+  issues: write    # self-alert step below
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          check-latest: true   # runner cache lags security releases
+
+      # `apt-get update` refreshes EVERY source on the runner image, including
+      # third-party ones this job has no use for, and one broken source fails
+      # the whole command. On 2026-08-29 Microsoft's
+      # packages.microsoft.com/ubuntu/24.04/prod repo went unsigned and killed
+      # this job with exit 100 — on an rclone install that only ever needed
+      # Ubuntu's own archive. Drop the third-party lists first, and fall back to
+      # rclone.org's published .deb if apt is unusable for any other reason, so
+      # a rotten runner-image repo can't cost a night of backups. mlb-research-dashboard's
+      # backup job carries this identical step.
+      - name: Install rclone
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/microsoft.list
+          if sudo apt-get update -qq && sudo apt-get install -y -qq rclone; then
+            rclone version
+          else
+            echo "apt unusable — falling back to rclone.org's .deb"
+            curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.deb -o /tmp/rclone.deb
+            sudo dpkg -i /tmp/rclone.deb
+            rclone version
+          fi
+
+      # Written once, here, because the snapshot check below needs rclone BEFORE
+      # the dump step. The later steps used to each re-write this file; they now
+      # inherit it.
+      - name: Configure rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+
+      # Both cron slots dump into the SAME dated folder, so the backstop run
+      # overwrites the primary's file. On an ordinary day where the primary ran,
+      # that meant re-downloading all 17k rows to write a byte-identical file —
+      # ~8 MB of Supabase egress for nothing, on an org that exceeded the free
+      # plan's egress quota on 2026-09-05.
+      #
+      # If today's folder already holds a snapshot, hand its write time to the
+      # dump step, which skips only when NOTHING has been created or graded since
+      # (a ~200-byte query). The retry property is untouched: a dropped primary
+      # leaves no folder, so `since` stays empty and the backstop dumps
+      # unconditionally. Listing failures are silent by design and also leave
+      # `since` empty — the safe direction is always "dump anyway".
+      - name: Is today's snapshot already current?
+        id: snap
+        run: |
+          DATE=$(date -u +%F)
+          # `run:` uses `bash -e`, so a folder that does not exist yet (rclone
+          # exits non-zero) would fail the step. Both halves are swallowed and
+          # `|| true` keeps the assignment successful — an unreadable listing
+          # must read as "no snapshot", never as a broken job.
+          rclone lsjson "gdrive:wnba-research-dashboard-backups/$DATE" --files-only > listing.json 2>/dev/null || echo '[]' > listing.json
+          MOD=$(jq -r '[.[] | select(.Name | startswith("wnba_picks"))] | max_by(.ModTime) | .ModTime // empty' listing.json 2>/dev/null || true)
+          if [ -n "$MOD" ]; then
+            echo "Today's folder already holds a snapshot written at $MOD"
+            echo "since=$MOD" >> "$GITHUB_OUTPUT"
+          else
+            echo "No snapshot on Drive for $DATE yet — dumping unconditionally."
+          fi
+
+      - name: Dump tables
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          ARGS="--out-dir=backup-out"
+          if [ -n "${{ github.event.inputs.tables }}" ]; then
+            ARGS="$ARGS --tables=${{ github.event.inputs.tables }}"
+          fi
+          if [ -n "${{ steps.snap.outputs.since }}" ]; then
+            ARGS="$ARGS --changed-since=${{ steps.snap.outputs.since }}"
+          fi
+          node scripts/backup-to-drive.mjs $ARGS
+
+      # A skipped dump leaves backup-out empty and this copies nothing, which is
+      # the intended no-op — today's folder already holds the identical snapshot.
+      - name: Upload to Google Drive
+        run: |
+          DATE=$(date -u +%F)
+          rclone copy backup-out "gdrive:wnba-research-dashboard-backups/$DATE" --transfers 4 -v
+
+      # Retention. The upload above writes a NEW DATED FOLDER every night and
+      # nothing ever removed one — 66 had accumulated by 2026-08-31, each holding
+      # a full dump of the same growing table. Policy: keep the last 14 nightly
+      # plus the first backup of every month.
+      #
+      # REPORT-ONLY BY DEFAULT, including on the schedule. These are the only
+      # offsite copies of wnba_picks, a retention bug is unrecoverable, and this
+      # repo has already lost uncommitted work once to a routine that ran a
+      # destructive command with no human reading it first. Deleting requires
+      # someone to dispatch this workflow with prune=apply.
+      - name: Retention (report only unless dispatched with prune=apply)
+        run: |
+          if [ "${{ github.event.inputs.prune }}" = "apply" ]; then
+            node scripts/prune-backups.mjs --apply
+          else
+            node scripts/prune-backups.mjs
+          fi
+
+      # Did a night slip through BOTH crons? Reports only; never fails the job,
+      # because the backup that just ran was fine and a red run here would train
+      # you to ignore a red run. It opens its own issue with its own title
+      # instead, so "a past night is missing" stays distinguishable from
+      # "tonight's backup broke".
+      - name: Detect missed nights
+        id: gaps
+        run: |
+          # NOT `node ... | tee`: in a pipeline bash reports the LAST command's
+          # status, so tee's success would mask the script's exit 1 and this
+          # would report "no gaps" forever. Redirect, then cat.
+          node scripts/prune-backups.mjs --check-gaps > gaps.txt 2>&1 && FOUND=0 || FOUND=1
+          cat gaps.txt
+          echo "found=$FOUND" >> "$GITHUB_OUTPUT"
+
+      - name: Alert on missed nights
+        if: steps.gaps.outputs.found == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="🗓️ WNBA backup: a scheduled night is missing"
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$TITLE\"" --json number,title \
+            --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+          BODY="Detected by [this run]($RUN_URL):
+
+          \`\`\`
+          $(cat gaps.txt)
+          \`\`\`
+
+          A dropped scheduled run never starts, so it cannot fail and the self-alert step cannot see it. The point-in-time copy for a missed night is not recoverable — dispatching this workflow re-dumps the table as it is now."
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
+          fi
+
+      # ops-alert.yml's workflow_run listener is NOT reliable on this account.
+      # Measured 2026-07-29 over 30 days: only 9 of 85 watched completions were
+      # ever delivered (11%), and it reacted to 0 of 2 real failures — this repo
+      # has never had a single alert issue opened. mlb-research-dashboard hit the same
+      # blind spot on its heaviest workflow and fixed it exactly this way.
+      # Firing the issue directly from the job removes the webhook dependency.
+      # Same title ops-alert would use, so if its listener DOES fire, the two
+      # dedupe onto one issue instead of opening two. cancelled() is included
+      # because a timeout-minutes kill is not reported as 'failure'.
+      # Costs zero Actions minutes on success — the step is simply skipped.
+      - name: Self-alert on failure (ops-alert workflow_run delivery is unreliable)
+        if: failure() || cancelled()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="🚨 Scheduled workflow failing: Nightly Supabase → Drive backup (WNBA)"
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$TITLE\"" --json number,title \
+            --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+          BODY="[Nightly Supabase → Drive backup (WNBA)]($RUN_URL) failed at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+            echo "Commented on existing issue #$EXISTING"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
+              --body "$BODY
+
+          Close this issue once the workflow is green again. Repeat failures will be added as comments here instead of new issues."
+            echo "Opened new issue"
+          fi
